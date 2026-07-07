@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SSE Market Monitor - Shanghai Stock Exchange Monitor
-Handles data collection from EASTMONEY with anti-crawler mechanisms
+Handles data collection from Sina/Tencent APIs (no anti-crawler issues)
 """
 
 import requests
@@ -10,34 +10,17 @@ import json
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional
-import time
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class SSEMarketMonitor:
-    """Monitor Shanghai Stock Exchange market data with anti-crawler support"""
+    """Monitor Shanghai Stock Exchange market data from Sina API"""
     
-    # Anti-crawler headers - CRITICAL for EASTMONEY bypass
-    HEADERS = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Referer': 'https://quote.eastmoney.com/',
-        'Origin': 'https://quote.eastmoney.com',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Cache-Control': 'max-age=0',
-    }
-    
-    # EASTMONEY API endpoints
-    BASE_URL = 'https://push2.eastmoney.com/api/qt/clist/get'
+    # Sina API - No anti-crawler protection
+    SINA_API_URL = 'https://vip.stock.finance.sina.com.cn/q_gab=sh,sz'
     
     def __init__(self, enable_validation: bool = True, max_stocks: int = 100, timeout: int = 10):
         """
@@ -53,95 +36,87 @@ class SSEMarketMonitor:
         self.timeout = timeout
         self.validated_stocks = []
         self.update_count = 0
-        self.session = self._create_session()
+        self.session = requests.Session()
         
-    def _create_session(self) -> requests.Session:
-        """Create requests session with connection pooling and retries"""
-        session = requests.Session()
-        session.headers.update(self.HEADERS)
-        
-        # Add retry mechanism
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
-        
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        
-        return session
-    
     def update(self) -> bool:
         """
-        Fetch and update market data from EASTMONEY
+        Fetch and update market data from Sina API
         
         Returns:
             bool: True if successful, False otherwise
         """
         try:
-            logger.info("Fetching SSE market data from EASTMONEY...")
+            logger.info("Fetching SSE market data from Sina API...")
             
-            # Parameters for EASTMONEY API
-            params = {
-                'param': 'sh,sz',  # Shanghai & Shenzhen exchanges
-                'fields': 'f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13,f14,f15,f16,f17,f18,f19,f20',
-                'pageindex': '0',
-                'pagesize': str(self.max_stocks),
-                'sortTypes': '0',
-                'sortFields': 'f2',
-                'ut': 'b2884a393a59ad6bfb0bda9987da3e0d',
-            }
+            # Fetch Shanghai stocks
+            sh_stocks = self._fetch_sina_stocks('sh')
             
-            # Make request with anti-crawler headers
-            response = self.session.get(
-                self.BASE_URL,
-                params=params,
-                timeout=self.timeout,
-                verify=True
-            )
+            # Fetch Shenzhen stocks
+            sz_stocks = self._fetch_sina_stocks('sz')
             
-            response.raise_for_status()
+            # Combine both
+            all_stocks = sh_stocks + sz_stocks
             
-            # Parse response
-            data = response.json()
-            
-            if data.get('rc') != 0:
-                logger.warning(f"API returned non-zero code: {data.get('rc')}")
+            if not all_stocks:
+                logger.warning("No stock data received from Sina")
                 return False
             
-            # Process stocks
-            stocks_data = data.get('data', {}).get('diff', [])
-            
-            if not stocks_data:
-                logger.warning("No stock data received from EASTMONEY")
-                return False
-            
-            self.validated_stocks = [
-                StockData.from_dict(stock) for stock in stocks_data
-            ]
-            
+            # Limit to max_stocks
+            self.validated_stocks = all_stocks[:self.max_stocks]
             self.update_count += 1
-            logger.info(f"Successfully fetched {len(self.validated_stocks)} stocks (Update #{self.update_count})")
             
+            logger.info(f"Successfully fetched {len(self.validated_stocks)} stocks (Update #{self.update_count})")
             return True
             
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"Connection error to EASTMONEY: {e}")
-            return False
-        except requests.exceptions.Timeout as e:
-            logger.error(f"Request timeout: {e}")
-            return False
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON response: {e}")
-            return False
         except Exception as e:
-            logger.error(f"Unexpected error fetching market data: {e}")
+            logger.error(f"Error fetching market data: {e}")
             return False
+    
+    def _fetch_sina_stocks(self, exchange: str) -> List['StockData']:
+        """
+        Fetch stocks from Sina for specific exchange
+        
+        Args:
+            exchange: 'sh' for Shanghai, 'sz' for Shenzhen
+            
+        Returns:
+            List of StockData objects
+        """
+        try:
+            url = f'https://vip.stock.finance.sina.com.cn/q_gab={exchange}'
+            response = self.session.get(url, timeout=self.timeout)
+            response.encoding = 'gb2312'
+            
+            stocks = []
+            # Parse response format: var hq_str_sh600000="浦发银行,12.34,1.23,2.5,..."
+            pattern = r'var hq_str_(\w+)="([^"]+)"'
+            
+            for match in re.finditer(pattern, response.text):
+                code = match.group(1)
+                data_str = match.group(2)
+                parts = data_str.split(',')
+                
+                if len(parts) >= 5:
+                    try:
+                        stock = StockData(
+                            code=code,
+                            name=parts[0],
+                            price=float(parts[3]),
+                            change_percent=float(parts[4]) if parts[4] else 0,
+                            volume=int(float(parts[8]) * 100) if len(parts) > 8 else 0
+                        )
+                        if stock.is_valid():
+                            stocks.append(stock)
+                    except (ValueError, IndexError) as e:
+                        logger.debug(f"Failed to parse stock {code}: {e}")
+                        continue
+            
+            logger.info(f"Fetched {len(stocks)} stocks from {exchange}")
+            return stocks
+            
+        except Exception as e:
+            logger.error(f"Error fetching {exchange} stocks from Sina: {e}")
+            return []
     
     def get_validation_report(self) -> Dict:
         """Get validation report of current data"""
@@ -200,24 +175,9 @@ class StockData:
         self.change_percent = change_percent
         self.volume = volume
     
-    @classmethod
-    def from_dict(cls, data: Dict):
-        """Create StockData from EASTMONEY API response"""
-        try:
-            return cls(
-                code=data.get('f12', ''),
-                name=data.get('f14', ''),
-                price=float(data.get('f2', 0)) / 100,  # Convert from cents
-                change_percent=float(data.get('f3', 0)) / 100,
-                volume=int(data.get('f5', 0))
-            )
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Failed to parse stock data: {e}")
-            return None
-    
     def is_valid(self) -> bool:
         """Check if stock data is valid"""
-        return bool(self.code and self.name and self.price >= 0)
+        return bool(self.code and self.name and self.price > 0)
     
     def to_dict(self) -> Dict:
         """Convert to dictionary"""
